@@ -13,7 +13,10 @@ use crate::{
   utils as client_utils,
 };
 use redis_protocol::resp3::types::BytesFrame as Resp3Frame;
-use std::mem;
+use std::{
+  mem,
+  ops::{Deref, DerefMut},
+};
 use tokio::pin;
 
 #[cfg(feature = "replicas")]
@@ -556,6 +559,50 @@ fn drain_command_rx(inner: &RefCount<ClientInner>, rx: &mut CommandReceiver) {
   }
 }
 
+/// Drains the command receiver if the routing task is dropped before it exits normally, for example when the caller
+/// aborts the connection task. Queued commands would otherwise be dropped without updating the command queue length,
+/// which prevents later commands from being flushed.
+struct CommandReceiverGuard<'a> {
+  inner: &'a RefCount<ClientInner>,
+  rx:    Option<CommandReceiver>,
+}
+
+impl<'a> CommandReceiverGuard<'a> {
+  fn new(inner: &'a RefCount<ClientInner>, rx: CommandReceiver) -> Self {
+    CommandReceiverGuard { inner, rx: Some(rx) }
+  }
+
+  /// Store the receiver back on the client without draining it.
+  fn store(mut self) {
+    if let Some(rx) = self.rx.take() {
+      self.inner.store_command_rx(rx, false);
+    }
+  }
+}
+
+impl Deref for CommandReceiverGuard<'_> {
+  type Target = CommandReceiver;
+
+  fn deref(&self) -> &CommandReceiver {
+    self.rx.as_ref().expect("Command receiver was already stored.")
+  }
+}
+
+impl DerefMut for CommandReceiverGuard<'_> {
+  fn deref_mut(&mut self) -> &mut CommandReceiver {
+    self.rx.as_mut().expect("Command receiver was already stored.")
+  }
+}
+
+#[cfg(not(feature = "glommio"))]
+impl Drop for CommandReceiverGuard<'_> {
+  fn drop(&mut self) {
+    if let Some(mut rx) = self.rx.take() {
+      drain_command_rx(self.inner, &mut rx);
+    }
+  }
+}
+
 /// Initialize connections and start the routing task.
 pub async fn start(inner: &RefCount<ClientInner>) -> Result<(), Error> {
   #[cfg(feature = "mocks")]
@@ -564,7 +611,7 @@ pub async fn start(inner: &RefCount<ClientInner>) -> Result<(), Error> {
   }
 
   let mut rx = match inner.take_command_rx() {
-    Some(rx) => rx,
+    Some(rx) => CommandReceiverGuard::new(inner, rx),
     None => {
       // the `_lock` field on inner synchronizes the getters/setters on the command channel halves, so if this field
       // is None then another task must have set and removed the receiver concurrently.
@@ -593,7 +640,7 @@ pub async fn start(inner: &RefCount<ClientInner>) -> Result<(), Error> {
   };
 
   if let Err(error) = result {
-    inner.store_command_rx(rx, false);
+    rx.store();
     Err(error)
   } else {
     #[cfg(feature = "credential-provider")]
@@ -620,7 +667,7 @@ pub async fn start(inner: &RefCount<ClientInner>) -> Result<(), Error> {
     #[cfg(feature = "credential-provider")]
     inner.abort_credential_refresh_task();
 
-    inner.store_command_rx(rx, false);
+    rx.store();
     result
   }
 }
@@ -824,12 +871,16 @@ mod mocking {
   }
 }
 
-#[cfg(all(test, not(any(feature = "glommio", feature = "smol", feature = "monoio"))))]
+#[cfg(all(
+  test,
+  feature = "i-keys",
+  not(any(feature = "glommio", feature = "smol", feature = "monoio"))
+))]
 mod tests {
   use crate::{
     clients::Client,
     error::{Error, ErrorKind},
-    interfaces::{ClientLike, MetricsInterface},
+    interfaces::{ClientLike, KeysInterface, MetricsInterface},
     types::{
       config::{Config, ConnectionConfig, PerformanceConfig, ReconnectPolicy, ServerConfig},
       ClusterHash,
@@ -981,10 +1032,9 @@ mod tests {
     )
   }
 
+  /// Run a regular `GET`, which is only flushed when no other commands are queued, unlike custom commands.
   async fn get(client: &Client) -> Result<Option<String>, Error> {
-    client
-      .custom(CustomCommand::new("GET", ClusterHash::FirstKey, false), vec!["key"])
-      .await
+    client.get("key").await
   }
 
   fn spawn_get(client: &Client) -> JoinHandle<Result<Option<String>, Error>> {
@@ -1122,5 +1172,39 @@ mod tests {
     assert!(canceled.await.expect("Failed to join").is_err());
     assert!(task.await.expect("Failed to join").is_ok());
     assert_eq!(client.command_queue_len(), 0);
+
+    let _task = client.connect();
+    client.wait_for_connect().await.expect("Failed to reconnect");
+    let value = get(&client).await.expect("Failed to run GET after quitting");
+    assert_eq!(value.as_deref(), Some("ok"));
+  }
+
+  #[tokio::test]
+  async fn should_decrement_queue_len_when_aborted() {
+    let peer = Peer::start().await;
+    let client = new_client(&peer, 10);
+    let task = client.connect();
+    client.wait_for_connect().await.expect("Failed to connect");
+
+    // abort the routing task while it is blocked with commands queued behind the blocking write
+    let blocked = block_routing_task(&client).await;
+    let queued = [spawn_get(&client), spawn_get(&client)];
+    tokio::task::yield_now().await;
+    task.abort();
+    assert!(task
+      .await
+      .expect_err("The routing task should be aborted.")
+      .is_cancelled());
+
+    assert!(blocked.await.expect("Failed to join").is_err());
+    for handle in queued {
+      assert!(handle.await.expect("Failed to join").is_err());
+    }
+    assert_eq!(client.command_queue_len(), 0);
+    // a lone command must be flushed after reconnecting
+    let _task = client.connect();
+    client.wait_for_connect().await.expect("Failed to reconnect");
+    let value = get(&client).await.expect("Failed to run GET after aborting");
+    assert_eq!(value.as_deref(), Some("ok"));
   }
 }
